@@ -187,8 +187,11 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
 
   let mod = null, emu = 0, ctx = null, sink = null;
   let startSec = 0, startTicks = 0, nextAudio = 0, running = false, wake = null;
+  let pushTicks = 0;            // emulator ticks at the end of the last audio buffer (which plays at nextAudio)
+  const frames = [], pool = []; // finished frames waiting for their sound to reach the speaker
+  let videoDelay = 0;
   const stats = { pushed: 0, min: 255, max: 0 };
-  window.groovesSound = () => ({ state: ctx && ctx.state, rate: ctx && ctx.sampleRate, time: ctx && ctx.currentTime, scheduledAhead: ctx ? nextAudio - ctx.currentTime : 0, ...stats });
+  window.groovesSound = () => ({ state: ctx && ctx.state, rate: ctx && ctx.sampleRate, time: ctx && ctx.currentTime, scheduledAhead: ctx ? nextAudio - ctx.currentTime : 0, outputLatency: ctx && ctx.outputLatency, baseLatency: ctx && ctx.baseLatency, videoDelayMs: Math.round(videoDelay), queued: frames.length, ...stats });
 
   const JOY = { up: '_set_joyp_up', down: '_set_joyp_down', left: '_set_joyp_left', right: '_set_joyp_right',
                 A: '_set_joyp_A', B: '_set_joyp_B', start: '_set_joyp_start', select: '_set_joyp_select' };
@@ -205,6 +208,7 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
     startSec = ctx.currentTime + LATENCY;
     startTicks = mod._emulator_get_ticks_f64(emu);
     nextAudio = 0;
+    frames.length = 0;
   }
 
   function pushAudio() {
@@ -220,12 +224,41 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
     src.connect(sink);
     src.start(nextAudio);
     nextAudio += AF / ctx.sampleRate;
+    pushTicks = mod._emulator_get_ticks_f64(emu);
   }
 
-  function draw() {
+  // Each frame is shown when its sound comes out of the speaker, not when it is made: the sound is
+  // scheduled ahead and the device adds its own output delay (large on phones and Bluetooth headphones).
+  function soundClock() {         // ctx time -> performance.now() at the speaker
+    const ts = ctx.getOutputTimestamp ? ctx.getOutputTimestamp() : null;
+    if (ts && ts.contextTime > 0 && ts.performanceTime > 0) {
+      const f = (t) => ts.performanceTime + (t - ts.contextTime) * 1000;
+      const lead = f(ctx.currentTime) - performance.now();   // sanity: the speaker is 0-1 s behind the render clock
+      if (lead > -50 && lead < 1000) return f;
+    }
+    const lat = (ctx.outputLatency || 0) + (ctx.baseLatency || 0), now = performance.now(), cur = ctx.currentTime;
+    return (t) => now + (t - cur + lat) * 1000;
+  }
+
+  function capture(toPerf) {
+    const ticks = mod._emulator_get_ticks_f64(emu);
+    const heard = nextAudio > 0 ? nextAudio + (ticks - pushTicks) / CPS : ctx.currentTime + LATENCY;
     const fb = new Uint8Array(mod.HEAPU8.buffer, mod._get_frame_buffer_ptr(emu), 160 * 144 * 4);
-    for (let i = 0, j = 0; i < 23040; i++, j += 4) out32[i] = LUT[fb[j]];
+    const px = pool.pop() || new Uint32Array(23040);
+    for (let i = 0, j = 0; i < 23040; i++, j += 4) px[i] = LUT[fb[j]];
+    frames.push({ at: toPerf(heard), made: performance.now(), px });
+    while (frames.length > 90) pool.push(frames.shift().px);
+  }
+
+  function present() {
+    const now = performance.now() + 8;    // within half a frame counts as due
+    let show = null;
+    while (frames.length && frames[0].at <= now) { if (show) pool.push(show.px); show = frames.shift(); }
+    if (!show) return;
+    videoDelay = performance.now() - show.made;
+    out32.set(show.px);
     c2d.putImageData(image, 0, 0);
+    pool.push(show.px);
   }
 
   function loop() {
@@ -234,15 +267,15 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
       let target = startTicks + (ctx.currentTime + LATENCY - startSec) * CPS;
       const cur = mod._emulator_get_ticks_f64(emu);
       if (target - cur > CPS / 2 || cur - target > CPS / 2) { resync(); target = cur + CPS / 60; }
-      let fresh = false;
+      const toPerf = soundClock();
       for (let guard = 0; guard < 64; guard++) {
         const ev = mod._emulator_run_until_f64(emu, target);
         if (ev & EV_AUDIO) pushAudio();
-        if (ev & EV_FRAME) fresh = true;
+        if (ev & EV_FRAME) capture(toPerf);
         if (ev & EV_UNTIL) break;
         if (ev & ~7) { running = false; msg.textContent = 'The emulator stopped. Reload the page to start again.'; msg.className = 'err'; return; }
       }
-      if (fresh) draw();
+      present();
     }
     requestAnimationFrame(loop);
   }
