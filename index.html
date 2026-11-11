@@ -65,6 +65,7 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
   padding: 4px 18px;
   font-weight: 600;
 }
+[hidden] { display: none !important; }   /* .power sets display: flex, which beat the hidden attribute */
 .power:focus-visible span { outline: 2px solid var(--fg); outline-offset: 2px; }
 .pad {
   display: grid;
