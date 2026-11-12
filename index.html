@@ -248,18 +248,25 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
   const ART_END = 64 * 160;             // screen lines 0-63: the art panel
   const TIME_Y0 = 125, TIME_Y1 = 131, TIME_X0 = 32, TIME_X1 = 144;  // m:ss (cols 4-7) and the bar (cols 9-17)
   const live = new Uint32Array(23040), heard = new Uint32Array(23040);
+  const TRACK = 0x1714;                 // track ($D714): the current track
+  const SETTLE = 60;                    // frames after a screen change (new track or screen) before the split resumes
   let liveMode = 0, haveHeard = false, liveNew = false;
+  let seq = 0, liveKey = -1, settleSeq = 0, heardSeq = -1, heardKey = -2, heardSettle = 0;
 
   function capture(toPerf) {
     const ticks = mod._emulator_get_ticks_f64(emu);
     const at = nextAudio > 0 ? nextAudio + (ticks - pushTicks) / CPS : ctx.currentTime + LATENCY;
     const fb = new Uint8Array(mod.HEAPU8.buffer, mod._get_frame_buffer_ptr(emu), 160 * 144 * 4);
     for (let i = 0, j = 0; i < 23040; i++, j += 4) live[i] = LUT[fb[j]];
-    liveMode = mod.HEAPU8[mod._emulator_get_wram_ptr(emu) + UI_MODE];
+    const wram = mod._emulator_get_wram_ptr(emu);
+    liveMode = mod.HEAPU8[wram + UI_MODE];
+    const key = liveMode * 256 + mod.HEAPU8[wram + TRACK];
+    seq++;
+    if (key !== liveKey) { liveKey = key; settleSeq = seq + SETTLE; }
     liveNew = true;
     const px = pool.pop() || new Uint32Array(23040);
     px.set(live);
-    frames.push({ at: toPerf(at), made: performance.now(), px });
+    frames.push({ at: toPerf(at), made: performance.now(), px, seq, key, settle: settleSeq });
     while (frames.length > 90) pool.push(frames.shift().px);
   }
 
@@ -271,11 +278,13 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
       videoDelay = performance.now() - show.made;
       heard.set(show.px);
       haveHeard = true;
+      heardSeq = show.seq; heardKey = show.key; heardSettle = show.settle;
       pool.push(show.px);
     } else if (!liveNew) return;
     liveNew = false;
     if (liveMode === 3 || !haveHeard) out32.set(live);          // the silent interstitial: live
     else if (liveMode !== 1) out32.set(heard);                    // title (its own song) and the Start sound: all with the sound
+    else if (heardKey !== liveKey || heardSeq < heardSettle) out32.set(heard);  // a screen change: all of it waits, so it isn't split
     else {                                                        // the player: art and time with the sound, the rest live
       out32.set(live);
       out32.set(heard.subarray(0, ART_END));
