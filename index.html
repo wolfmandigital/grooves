@@ -65,7 +65,8 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
   padding: 4px 18px;
   font-weight: 600;
 }
-[hidden] { display: none !important; }   /* .power sets display: flex, which beat the hidden attribute */
+[hidden] { display: none !important; }
+.power.back { background: transparent !important; }        /* coming back to the tab: the paused screen stays visible behind Play */   /* .power sets display: flex, which beat the hidden attribute */
 .power:focus-visible span { outline: 2px solid var(--fg); outline-offset: 2px; }
 .pad {
   display: grid;
@@ -293,9 +294,98 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
     c2d.putImageData(image, 0, 0);
   }
 
+  // Coming back to the tab or app: phones (iOS especially) often leave the audio asleep, or say it is running while
+  // its clock stands still, and only a tap can wake it. The picture follows the audio clock, so that looked frozen.
+  // Watch the clock; if it stops while the page is visible, show Play, and the tap starts fresh audio.
+  let lastTime = -1, lastMove = 0, lastWatch = 0, stalled = false;
+  function watch() {
+    const now = performance.now();
+    if (now - lastWatch > 300) lastMove = now;   // first frame back after a gap: give the audio a moment to wake
+    lastWatch = now;
+    if (ctx.state === 'running' && ctx.currentTime !== lastTime) { lastTime = ctx.currentTime; lastMove = now; return; }
+    if (document.visibilityState === 'visible' && now - lastMove > 700 && !stalled) {
+      stalled = true;
+      Object.keys(held).forEach((k) => setKey(k, false));
+      power.classList.add('back');
+      power.setAttribute('aria-label', 'Play');
+      power.querySelector('span').textContent = 'Play';
+      power.disabled = false;
+      power.hidden = false;
+    }
+  }
+
+  function newAudio(rate) {                       // must run inside a tap or key press; returns { ctx, sink, woke }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    let c;
+    try { c = new AC(rate ? { latencyHint: 'interactive', sampleRate: rate } : { latencyHint: 'interactive' }); }
+    catch (e) { c = new AC({ latencyHint: 'interactive' }); }
+    const blip = c.createBufferSource();          // Safari: a sound must start inside the tap itself
+    blip.buffer = c.createBuffer(1, 1, c.sampleRate);
+    blip.connect(c.destination);
+    blip.start(0);
+    const woke = c.resume().catch(() => {});
+    const hp = c.createBiquadFilter();            // the cart's output capacitor: drop the DC offset
+    hp.type = 'highpass';
+    hp.frequency.value = 20;
+    hp.connect(c.destination);
+    return { ctx: c, sink: hp, woke };
+  }
+
+  // iOS can leave the whole audio session off after an app switch, so even new audio stays silent and still.
+  // Playing a short silent <audio> clip inside the tap turns the session back on.
+  let tag = null;
+  function sessionKick() {
+    try {
+      if (!tag) {
+        const n = 44100, b = new ArrayBuffer(44 + n * 2), v = new DataView(b), w = (o, t) => { for (let i = 0; i < 4; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+        w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true);
+        v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, 44100, true); v.setUint32(28, 88200, true);
+        v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
+        tag = new Audio(URL.createObjectURL(new Blob([b], { type: 'audio/wav' })));
+        tag.setAttribute('playsinline', '');
+        tag.preload = 'auto';
+      }
+      tag.currentTime = 0;
+      tagNote = 'asked';
+      const pr = tag.play(); if (pr) pr.then(() => { tagNote = 'played'; }, (e) => { tagNote = 'refused ' + (e && e.name); });
+    } catch (e) {}
+    try { if (navigator.audioSession) { navigator.audioSession.type = 'auto'; navigator.audioSession.type = 'playback'; } } catch (e) {}
+  }
+
+  const nap = (ms) => new Promise((r) => setTimeout(r, ms));
+  let tagNote = 'none';
+  async function revive() {
+    if (power.disabled) return;
+    power.disabled = true;
+    power.querySelector('span').textContent = 'Loading';
+    sessionKick();
+    // iOS shares one audio output across the page and only restarts it when every context has stopped and a tap
+    // starts one again; an old context left "running" (with a dead clock) keeps it stuck. So: stop the old one first.
+    const old = ctx, rate = old.sampleRate, oldState = old.state;
+    try { old.suspend().catch(() => {}); } catch (e) {}
+    try { old.close().catch(() => {}); } catch (e) {}
+    const fresh = newAudio(rate);
+    ctx = fresh.ctx; sink = fresh.sink;
+    await nap(250);
+    const t0 = ctx.currentTime;
+    await nap(300);
+    const ok = ctx.state === 'running' && ctx.currentTime > t0;
+    if (!ok) {                                   // still stuck: toggle it (needs the tap, so this only helps the next one)
+      try { ctx.suspend().then(() => ctx.resume()).catch(() => {}); } catch (e) {}
+    }
+    window.groovesRevive = { was: oldState, now: ctx.state + (ok ? ' moving' : ' still'), tag: tagNote, tries: (window.groovesRevive ? window.groovesRevive.tries : 0) + 1 };
+    if (DEBUG) msg.textContent = 'revive: ' + JSON.stringify(window.groovesRevive);
+    resync();
+    lastTime = -1; lastMove = performance.now(); stalled = false;
+    power.hidden = true;
+    power.disabled = false;
+    lockScreen();
+  }
+
   function loop() {
     if (!running) return;
-    if (ctx.state === 'running') {
+    watch();
+    if (ctx.state === 'running' && !stalled) {
       let target = startTicks + (ctx.currentTime + LATENCY - startSec) * CPS;
       const cur = mod._emulator_get_ticks_f64(emu);
       if (target - cur > CPS / 2 || cur - target > CPS / 2) { resync(); target = cur + CPS / 60; }
@@ -308,7 +398,7 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
         if (ev & ~7) { running = false; msg.textContent = 'The emulator stopped. Reload the page to start again.'; msg.className = 'err'; return; }
       }
       present();
-      if (DEBUG && ++dbgN % 30 === 0) { const g = window.groovesSound(); msg.textContent = `delay ${g.videoDelayMs} ms, mode ${g.uiMode}, out ${Math.round((g.outputLatency || 0) * 1000)} ms, base ${Math.round((g.baseLatency || 0) * 1000)} ms, ahead ${Math.round(g.scheduledAhead * 1000)} ms, ts ${ctx.getOutputTimestamp ? 'yes' : 'no'}`; }
+      if (DEBUG && ++dbgN % 30 === 0) { const g = window.groovesSound(); msg.textContent = `delay ${g.videoDelayMs} ms, mode ${g.uiMode}, out ${Math.round((g.outputLatency || 0) * 1000)} ms, base ${Math.round((g.baseLatency || 0) * 1000)} ms, ahead ${Math.round(g.scheduledAhead * 1000)} ms, ts ${ctx.getOutputTimestamp ? 'yes' : 'no'}` + (window.groovesRevive ? ', revive ' + JSON.stringify(window.groovesRevive) : ''); }
     }
     requestAnimationFrame(loop);
   }
@@ -323,19 +413,9 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
     power.querySelector('span').textContent = 'Loading';
     try {
       try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
-      const AC = window.AudioContext || window.webkitAudioContext;
-      ctx = new AC({ latencyHint: 'interactive' });
-      const blip = ctx.createBufferSource();       // Safari: a sound must start inside the tap itself
-      blip.buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
-      blip.connect(ctx.destination);
-      blip.start(0);
-      const woke = ctx.resume();
-      await woke;
-      const hp = ctx.createBiquadFilter();          // the cart's output capacitor: drop the DC offset
-      hp.type = 'highpass';
-      hp.frequency.value = 20;
-      hp.connect(ctx.destination);
-      sink = hp;
+      const first = newAudio(0);
+      ctx = first.ctx; sink = first.sink;
+      await first.woke;
 
       mod = await Binjgb({ wasmBinary: b64(WASM_B64) });
       const rom = b64(ROM_B64);
@@ -346,6 +426,7 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
       Object.keys(held).forEach((k) => { if (held[k]) mod[JOY[k]](emu, 1); });
 
       resync();
+      lastMove = performance.now();
       running = true;
       power.hidden = true;
       lockScreen();
@@ -357,23 +438,35 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
       msg.className = 'err';
     }
   }
-  power.addEventListener('click', boot);
+  power.addEventListener('click', () => (emu ? revive() : boot()));
 
   // any later tap or key re-wakes the audio if the browser put it to sleep
-  const wakeAudio = () => { if (ctx && ctx.state !== 'running' && document.visibilityState === 'visible') ctx.resume().catch(() => {}); };
-  window.addEventListener('pointerdown', wakeAudio, true);
-  window.addEventListener('keydown', wakeAudio, true);
+  const wakeAudio = () => { if (ctx && !stalled && ctx.state !== 'running' && ctx.state !== 'closed' && document.visibilityState === 'visible') ctx.resume().catch(() => {}); };
+  ['pointerdown', 'touchend', 'click', 'keydown'].forEach((t) => window.addEventListener(t, wakeAudio, true));
 
   // ROM download: a plain link to the zip
   $('dl').href = URL.createObjectURL(new Blob([b64(ZIP_B64)], { type: 'application/zip' }));
   $('dl').download = ZIP_NAME;
   $('dl-row').hidden = false;
 
+  // leaving pauses; coming back resumes where it was (or shows Play if the phone wants a tap first)
+  async function onShow() {
+    if (!ctx || stalled) return;
+    lastMove = performance.now();
+    if (ctx.state !== 'closed') { try { await ctx.resume(); } catch (e) {} }
+    if (document.visibilityState !== 'visible') return;
+    if (emu) resync();
+    lockScreen();
+  }
   document.addEventListener('visibilitychange', async () => {
     if (!ctx) return;
-    if (document.visibilityState === 'hidden') { try { await ctx.suspend(); } catch (e) {} }
-    else { try { await ctx.resume(); } catch (e) {} if (emu) resync(); lockScreen(); }
+    if (document.visibilityState === 'hidden') {
+      Object.keys(held).forEach((k) => setKey(k, false));
+      try { await ctx.suspend(); } catch (e) {}
+      if (document.visibilityState === 'visible') onShow();    // came back before the suspend finished
+    } else onShow();
   });
+  window.addEventListener('pageshow', (e) => { if (e.persisted) onShow(); });
 
   // buttons: press on pointerdown, release on up / cancel / leaving the button
   document.querySelectorAll('.pad [data-key]').forEach((el) => {
@@ -408,7 +501,7 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
     const k = KEYS[e.code];
     if (!k || e.metaKey || e.ctrlKey || e.altKey) return;
     e.preventDefault();
-    if (!emu && (k === 'start' || k === 'A') && !power.disabled) { boot(); return; }
+    if ((k === 'start' || k === 'A') && !power.disabled && !power.hidden) { emu ? revive() : boot(); return; }
     setKey(k, true);
   });
   window.addEventListener('keyup', (e) => { const k = KEYS[e.code]; if (k) setKey(k, false); });
