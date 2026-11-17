@@ -7,17 +7,17 @@
 <style>
 /* Plain page: the screen, the buttons, a few lines of help. */
 :root {
-  --bg: #ffffff;
-  --fg: #111111;
-  --muted: #555555;
-  --line: #111111;
-  --btn: #f2f2f2;
-  --btn-on: #cccccc;
+  --bg: #121412;           /* night mode (user, 2026-11-16: the white page was harsh) */
+  --fg: #d8ddd2;
+  --muted: #8d948a;
+  --line: #3a4038;
+  --btn: #343a33;
+  --btn-on: #4e564c;
   --lcd-0: #c9dc97;        /* the cart label's greens, lightest to darkest (the game screen) */
   --lcd-1: #8fa86a;
   --lcd-2: #4a6040;
   --lcd-3: #0f1c16;
-  color-scheme: light;
+  color-scheme: dark;
 }
 body {
   background: var(--bg);
@@ -112,7 +112,7 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
 .keys dd { margin: 0; }
 .small { color: var(--muted); font-size: 13px; }
 .small a { color: var(--fg); }
-.err { color: #a00000; font-weight: 600; }
+.err { color: #ff8a80; font-weight: 600; }
 @media (max-width: 370px) {
   .dpad { grid-template-columns: repeat(3, 42px); grid-template-rows: repeat(3, 42px); }
   .dpad .k { width: 42px; height: 42px; }
