@@ -165,7 +165,10 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
 
   const CPS = 4194304;          // Game Boy CPU ticks per second
   const AF = 2048;              // audio frames per emulator buffer
-  const LATENCY = 0.12;         // seconds of audio scheduled ahead
+  const LATENCY = 0.12;         // seconds of audio scheduled ahead (normal phones and desktops)
+  const LEAD_MAX = 2.0;         // the most we will ever queue (seconds)
+  let lead = LATENCY, bump = 0, gaps = [];   // lead grows when the page is called too rarely to keep the queue full (CarPlay, dimmed or
+                                // power-saving phones throttle the screen callback), so the sound never runs dry
   const EV_FRAME = 1, EV_AUDIO = 2, EV_UNTIL = 4;
 
   const $ = (id) => document.getElementById(id);
@@ -219,7 +222,10 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
     for (let i = 0; i < AF; i++) { L[i] = a[2 * i] / 255; R[i] = a[2 * i + 1] / 255; }
     stats.pushed++; for (let i = 0; i < AF * 2; i += 64) { const v = a[i]; if (v > stats.max) stats.max = v; if (v < stats.min) stats.min = v; }
     const now = ctx.currentTime;
-    if (nextAudio < now + 0.01) nextAudio = now + LATENCY;
+    if (nextAudio < now + 0.01) {                    // the queue ran dry: a gap was heard, so queue further ahead from now on
+      if (nextAudio > 0) { stats.underruns = (stats.underruns || 0) + 1; bump = Math.min(LEAD_MAX, bump + 0.25); }
+      nextAudio = now + LATENCY;
+    }
     const src = ctx.createBufferSource();
     src.buffer = buf;
     src.connect(sink);
@@ -382,15 +388,27 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
     lockScreen();
   }
 
+  let lastStep = 0;
+  const SLOW = DEBUG_SLOW();                          // ?slow=MS: test mode that only runs every MS ms, like a throttled phone
   function loop() {
     if (!running) return;
+    const nowMs = performance.now();
+    if (SLOW && nowMs - lastStep < SLOW) { requestAnimationFrame(loop); return; }
+    if (lastStep && document.visibilityState === 'visible') {
+      const gap = (nowMs - lastStep) / 1000;          // time since the last run: queue at least 1.5x the longest recent gap
+      if (gap < 5) gaps.push([nowMs, gap]);
+    }
+    while (gaps.length && nowMs - gaps[0][0] > 15000) gaps.shift();      // the last 15 s decide
+    if (lastStep) bump = Math.max(0, bump - (nowMs - lastStep) / 1000 / 60);   // a dry-queue bump fades over about a minute
+    lead = Math.min(LEAD_MAX, Math.max(LATENCY, bump, gaps.reduce((m, g) => Math.max(m, g[1]), 0) * 1.5 + 0.05));
+    lastStep = nowMs;
     watch();
     if (ctx.state === 'running' && !stalled) {
-      let target = startTicks + (ctx.currentTime + LATENCY - startSec) * CPS;
+      let target = startTicks + (ctx.currentTime + lead - startSec) * CPS;
       const cur = mod._emulator_get_ticks_f64(emu);
-      if (target - cur > CPS / 2 || cur - target > CPS / 2) { resync(); target = cur + CPS / 60; }
+      if (target - cur > CPS * (LEAD_MAX + 1) || cur - target > CPS * (LEAD_MAX + 1)) { resync(); target = cur + CPS / 60; }
       const toPerf = soundClock();
-      for (let guard = 0; guard < 64; guard++) {
+      for (let guard = 0; guard < 4000; guard++) {          // enough to catch up a long throttled gap (~2 s of frames and sound)
         const ev = mod._emulator_run_until_f64(emu, target);
         if (ev & EV_AUDIO) pushAudio();
         if (ev & EV_FRAME) capture(toPerf);
@@ -398,11 +416,12 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
         if (ev & ~7) { running = false; msg.textContent = 'The emulator stopped. Reload the page to start again.'; msg.className = 'err'; return; }
       }
       present();
-      if (DEBUG && ++dbgN % 30 === 0) { const g = window.groovesSound(); msg.textContent = `delay ${g.videoDelayMs} ms, mode ${g.uiMode}, out ${Math.round((g.outputLatency || 0) * 1000)} ms, base ${Math.round((g.baseLatency || 0) * 1000)} ms, ahead ${Math.round(g.scheduledAhead * 1000)} ms, ts ${ctx.getOutputTimestamp ? 'yes' : 'no'}` + (window.groovesRevive ? ', revive ' + JSON.stringify(window.groovesRevive) : ''); }
+      if (DEBUG && ++dbgN % 30 === 0) { const g = window.groovesSound(); msg.textContent = `lead ${Math.round(lead * 1000)} ms, gaps ${stats.underruns || 0}, delay ${g.videoDelayMs} ms, mode ${g.uiMode}, out ${Math.round((g.outputLatency || 0) * 1000)} ms, base ${Math.round((g.baseLatency || 0) * 1000)} ms, ahead ${Math.round(g.scheduledAhead * 1000)} ms, ts ${ctx.getOutputTimestamp ? 'yes' : 'no'}` + (window.groovesRevive ? ', revive ' + JSON.stringify(window.groovesRevive) : ''); }
     }
     requestAnimationFrame(loop);
   }
   const DEBUG = /[?&]debug/.test(location.search); let dbgN = 0;
+  function DEBUG_SLOW() { const m = /[?&]slow=(\d+)/.exec(location.search); return m ? +m[1] : 0; }
 
   async function lockScreen() {
     try { if ('wakeLock' in navigator && document.visibilityState === 'visible') wake = await navigator.wakeLock.request('screen'); } catch (e) {}
@@ -451,6 +470,7 @@ canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; 
 
   // leaving pauses; coming back resumes where it was (or shows Play if the phone wants a tap first)
   async function onShow() {
+    lastStep = 0;                                      // time away is not a throttle gap
     if (!ctx || stalled) return;
     lastMove = performance.now();
     if (ctx.state !== 'closed') { try { await ctx.resume(); } catch (e) {} }
